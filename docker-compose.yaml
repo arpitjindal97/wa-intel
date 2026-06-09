@@ -1,0 +1,16 @@
+services:
+  wa-intel:
+    build: .
+    container_name: wa-intel
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - ./data:/app/data
+      - ./config.yaml:/app/config.yaml:ro
+      - /root/.local/bin/hermes:/usr/local/bin/hermes:ro
+      - /root/.hermes:/root/.hermes
+      - /usr/local/lib/hermes-agent:/usr/local/lib/hermes-agent:ro
+    environment:
+      - TZ=Europe/Amsterdam
+    env_file:
+      - .env

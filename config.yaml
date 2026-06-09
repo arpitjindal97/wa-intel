@@ -1,0 +1,24 @@
+whatsapp_api: http://localhost:3000
+hermes_gateway: http://localhost:8644
+hermes_brain_route: wa-intel-brain
+hermes_webhook_secret: WcLs-LNIt_Dk9S_d517njkmPfMoQkfJ2NJ31CG5ARB0
+listen: :8090
+db_path: ./data/wa-intel.db
+
+poller:
+  chat_sync_interval: 5m
+  message_sync_interval: 1m
+  sync_history_on_start: true
+  active_chat_window: 24h
+
+analysis:
+  feed_batch_threshold: 3
+  feed_silence_trigger: 2m
+  feed_fresh_threshold: 30m
+
+inner_circle: []
+muted_chats: []
+timezone: Europe/Amsterdam
+
+telegram_bot_token: "8749488228:AAFfauiv9MyQ7x-WG5DSMwQCuSBRnKYP5d8"
+telegram_group_id: -5240413902
