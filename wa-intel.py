@@ -6,7 +6,7 @@ Dumb pipe: collect, store, trigger. No LLM calls.
 """
 
 import sqlite3, json, time, threading, subprocess, os, sys
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import HTTPServer, ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.request import urlopen, Request
 from urllib.error import URLError
 from urllib.parse import unquote, parse_qs
@@ -397,7 +397,9 @@ def _enqueue_brain_task(chat_id, source="event", limit=None, force=False):
     else:
         prev_summary, prev_pending, prev_covered = "", "", 0
 
-    if has_prior:
+    # force_treats_as_no_prior: when force=True, ignore prev_covered
+    # and pull the last N messages — this is the on-demand rebuild path.
+    if has_prior and not force:
         # limit defaults to 100 for boot/event; on-demand can pass higher.
         eff_limit = limit if limit is not None else 100
         msgs = q(
@@ -418,7 +420,7 @@ def _enqueue_brain_task(chat_id, source="event", limit=None, force=False):
         )[::-1]
 
     if not msgs:
-        return  # nothing to process
+        return None  # nothing to process
 
     last_ts = max(m[0] for m in msgs)
 
@@ -640,6 +642,8 @@ Mark this kanban task complete when all relevant steps are done.
         "UPDATE chats SET unread_count=0, last_notified_at=? WHERE id=?",
         (int(time.time()), chat_id),
     )
+
+    return task_id if enqueued else None
 
 
 def _feed_hermes(chat_id):
@@ -1197,13 +1201,24 @@ Based on these results, answer the user's question naturally and concisely. Be d
 # === HTTP Server ===
 def _summarize_on_demand(chat_id, limit=2000):
     """On-demand summary: refetch messages from the WA API (up to `limit`),
-    then enqueue a kanban task with the same `limit` driving the transcript
-    window.
+    catch up any missing media downloads for this chat, then enqueue a kanban
+    task whose transcript window respects `limit`.
 
-    Used by POST /api/summarize/<chat_id>. Lets the brain build (or rebuild)
-    a summary for any chat regardless of whether it was caught by boot sync.
+    Used by POST /api/summarize/<chat_id>. Three-phase, all on the request
+    thread so the response only returns once the brain task is enqueued and
+    Melissa can rely on it being in flight:
 
-    Returns a dict with what happened.
+      1) _fetch_chat_msgs(chat_id, limit) — refetches from WA API; spawns
+         _download_media for any NEW inserts.
+      2) media catch-up — iterate messages with type in (image/video/...) and
+         media_path='' and media_summary_done=0; spawn _download_media for
+         each (bounded parallelism, total wait cap MEDIA_CATCHUP_WAIT_SEC).
+         This catches anything stored before the media flow existed or
+         anything where the prior download was lost.
+      3) _enqueue_brain_task(source="ondemand", limit=limit) — builds the
+         transcript with all media that finished downloading inline.
+
+    Returns a dict with what happened, including media counts.
     """
     fetched = 0
     err = None
@@ -1212,14 +1227,61 @@ def _summarize_on_demand(chat_id, limit=2000):
     except Exception as e:
         err = str(e)
 
+    # Phase 2 — media catch-up
+    media_pending_before = 0
+    media_downloaded = 0
+    try:
+        pending_rows = q(
+            "SELECT id FROM messages WHERE chat_id=? "
+            "AND type IN ('image','video','sticker','audio','ptt','document') "
+            "AND (media_path IS NULL OR media_path='') "
+            "AND media_summary_done=0",
+            (chat_id,),
+        )
+        media_pending_before = len(pending_rows)
+        if pending_rows:
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            from concurrent.futures import TimeoutError as FutTimeout
+            wait_cap = int(os.getenv("MEDIA_CATCHUP_WAIT_SEC", "120"))
+            workers = int(os.getenv("MEDIA_CATCHUP_PARALLELISM", "4"))
+            print(f"  ondemand media catch-up: {len(pending_rows)} pending "
+                  f"for {chat_id}; up to {workers}-way parallel, {wait_cap}s cap")
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = [pool.submit(_download_media, chat_id, mid, "")
+                           for (mid,) in pending_rows]
+                try:
+                    for f in as_completed(futures, timeout=wait_cap):
+                        try:
+                            f.result()
+                        except Exception:
+                            pass
+                except FutTimeout:
+                    print(f"  ondemand media catch-up: hit {wait_cap}s wait cap; "
+                          f"continuing with whatever finished")
+            # Recount media_path so the response reflects truth
+            media_downloaded = qone(
+                "SELECT COUNT(*) FROM messages WHERE chat_id=? AND media_path!=''",
+                (chat_id,),
+            ) or 0
+            print(f"  ondemand media catch-up: done; {media_downloaded} files "
+                  f"now on disk for {chat_id}")
+    except Exception as e:
+        err = (err + "; " if err else "") + f"media-catchup: {e}"
+
     total = qone("SELECT COUNT(*) FROM messages WHERE chat_id=?", (chat_id,)) or 0
     chat_name = qone("SELECT name FROM chats WHERE id=?", (chat_id,)) or chat_id
 
     enqueued = False
+    task_id = ""
     if total > 0:
         try:
-            _enqueue_brain_task(chat_id, source="ondemand", limit=limit)
-            enqueued = True
+            # force=True bypasses idempotency AND uses the no-prior message window
+            tid = _enqueue_brain_task(chat_id, source="ondemand", limit=limit, force=True)
+            if tid:
+                enqueued = True
+                task_id = tid
+            else:
+                err = (err + "; " if err else "") + "enqueue returned no task_id"
         except Exception as e:
             err = (err + "; " if err else "") + f"enqueue: {e}"
 
@@ -1228,7 +1290,10 @@ def _summarize_on_demand(chat_id, limit=2000):
         "chat_name": chat_name,
         "fetched": fetched,
         "total_messages": total,
+        "media_pending_before": media_pending_before,
+        "media_on_disk_now": media_downloaded,
         "enqueued": enqueued,
+        "task_id": task_id,
         "limit": limit,
         "error": err,
     }
@@ -1324,7 +1389,7 @@ if __name__ == "__main__":
     threading.Thread(target=_poll_loop, daemon=True).start()
     threading.Thread(target=_silence_check_loop, daemon=True).start()
     threading.Thread(target=_wa_health_loop, daemon=True).start()
-    server = HTTPServer(("0.0.0.0", LISTEN_PORT), Handler)
+    server = ThreadingHTTPServer(("0.0.0.0", LISTEN_PORT), Handler)
     print(f"wa-intel v4 listening on :{LISTEN_PORT}")
     try:
         server.serve_forever()
